@@ -3,7 +3,7 @@
 // @name            Explorer Toggle Details Pane
 // @description     Toggle Explorer panes when clicking empty space
 // @version         0.2
-// @author          Djinx
+// @author          roosmsg
 // @include         explorer.exe
 // @compilerOptions -lcomctl32 -loleaut32 -lole32
 // @architecture    x86-64
