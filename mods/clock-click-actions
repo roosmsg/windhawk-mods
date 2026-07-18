@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              clock-click-actions
 // @name            Clock click actions
-// @description     Configure left, middle and right click actions for the Windows 11 taskbar clock
-// @version         0.4
+// @description     Configure taskbar clock click actions
+// @version         0.5
 // @author          roosmsg
 // @github          https://github.com/roosmsg
 // @include         explorer.exe
@@ -24,10 +24,15 @@ Supported actions:
 - Open an application, path, or URL.
 - Do nothing.
 
+Optionally, apply a custom color to text in the Windows system tray, including
+the clock, date, language indicator, and text-based tray icons. The hidden-icons
+arrow and image-based notification icons aren't changed.
+
 The clock tooltip is hidden while the mod is active.
 
-This mod targets the Windows 11 taskbar clock/notification button only. It
-doesn't support the legacy Windows 10 taskbar.
+The click actions target the Windows 11 taskbar clock/notification button. The
+text-color option targets the Windows system tray. The legacy Windows 10
+taskbar isn't supported.
 
 For custom targets, use values such as `notepad.exe`,
 `C:\Windows\System32\calc.exe`, `C:\Users\Public`, `https://example.com`, or a
@@ -67,6 +72,14 @@ Windows URI such as `ms-settings:`.
 - rightClickTarget: ""
   $name: Right click application, path or URL
   $description: Used when the right click action is "Open application, path or URL".
+- enableTrayTextColor: false
+  $name: Use custom system tray text color
+  $description: Colors tray text and text-based icons except for the hidden-icons arrow.
+- trayTextColor: "#FFFFFF"
+  $name: System tray text color
+  $description: >-
+    Enter a color name (such as Red) or an RGB/ARGB color code (such as
+    #00FF00 or #CC00FF00).
 */
 // ==/WindhawkModSettings==
 
@@ -88,14 +101,19 @@ Windows URI such as `ms-settings:`.
 #undef GetCurrentTime
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Interop.h>
+#include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/base.h>
 
 namespace wf = winrt::Windows::Foundation;
+namespace wui = winrt::Windows::UI;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace wuxc = winrt::Windows::UI::Xaml::Controls;
+namespace wuxmk = winrt::Windows::UI::Xaml::Markup;
 namespace wuxm = winrt::Windows::UI::Xaml::Media;
 
 enum class ClickAction {
@@ -119,12 +137,15 @@ struct Settings {
     std::wstring middleClickTarget;
     ClickAction rightClickAction = ClickAction::OpenQuickSettings;
     std::wstring rightClickTarget;
+    bool enableTrayTextColor = false;
+    std::wstring trayTextColor = L"#FFFFFF";
 };
 
 Settings g_settings;
 std::mutex g_settingsMutex;
 
 std::atomic<bool> g_initialized;
+std::atomic<bool> g_unloading;
 std::atomic<bool> g_inputSiteProcHooked;
 std::atomic<UINT32> g_suppressedPointerId;
 std::atomic<MouseButton> g_suppressedMouseButton{MouseButton::None};
@@ -187,6 +208,8 @@ void LoadSettings() {
     settings.rightClickAction =
         ReadActionSetting(L"rightClickAction", ClickAction::OpenQuickSettings);
     settings.rightClickTarget = ReadStringSetting(L"rightClickTarget");
+    settings.enableTrayTextColor = Wh_GetIntSetting(L"enableTrayTextColor");
+    settings.trayTextColor = ReadStringSetting(L"trayTextColor");
 
     std::lock_guard<std::mutex> guard(g_settingsMutex);
     g_settings = std::move(settings);
@@ -209,6 +232,16 @@ ClickActionSnapshot GetActionSnapshot(MouseButton button) {
     }
 
     return {g_settings.leftClickAction, g_settings.leftClickTarget};
+}
+
+struct TrayTextColorSnapshot {
+    bool enabled;
+    std::wstring color;
+};
+
+TrayTextColorSnapshot GetTrayTextColorSnapshot() {
+    std::lock_guard<std::mutex> guard(g_settingsMutex);
+    return {g_settings.enableTrayTextColor, g_settings.trayTextColor};
 }
 
 PCWSTR MouseButtonName(MouseButton button) {
@@ -401,6 +434,153 @@ wux::FrameworkElement FindDescendantByName(wux::FrameworkElement element,
     return nullptr;
 }
 
+wux::FrameworkElement FindDescendantByClassName(
+    wux::FrameworkElement element,
+    PCWSTR className) {
+    if (!element) {
+        return nullptr;
+    }
+
+    if (winrt::get_class_name(element) == className) {
+        return element;
+    }
+
+    int childrenCount = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i)
+                         .try_as<wux::FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+
+        if (auto result = FindDescendantByClassName(child, className)) {
+            return result;
+        }
+    }
+
+    return nullptr;
+}
+
+struct TrayTextBlockState {
+    winrt::weak_ref<wuxc::TextBlock> textBlock;
+    wf::IInspectable originalForeground;
+};
+
+std::vector<TrayTextBlockState> g_trayTextBlockStates;
+
+void RestoreTrayTextBlockForeground(wuxc::TextBlock textBlock,
+                                    wf::IInspectable originalForeground) {
+    auto dependencyObject = textBlock.as<wux::DependencyObject>();
+    if (!originalForeground ||
+        originalForeground == wux::DependencyProperty::UnsetValue()) {
+        dependencyObject.ClearValue(wuxc::TextBlock::ForegroundProperty());
+    } else {
+        dependencyObject.SetValue(wuxc::TextBlock::ForegroundProperty(),
+                                  originalForeground);
+    }
+}
+
+void RestoreTrayTextColors() {
+    for (auto& state : g_trayTextBlockStates) {
+        auto textBlock = state.textBlock.get();
+        if (!textBlock) {
+            continue;
+        }
+
+        try {
+            RestoreTrayTextBlockForeground(textBlock,
+                                           state.originalForeground);
+        } catch (...) {
+            Wh_Log(L"Failed to restore tray text color: %08X",
+                   winrt::to_hresult());
+        }
+    }
+
+    g_trayTextBlockStates.clear();
+}
+
+void ApplyTrayTextColorToTextBlock(wuxc::TextBlock textBlock,
+                                   wui::Color color) {
+    for (auto it = g_trayTextBlockStates.begin();
+         it != g_trayTextBlockStates.end();) {
+        auto trackedTextBlock = it->textBlock.get();
+        if (!trackedTextBlock) {
+            it = g_trayTextBlockStates.erase(it);
+            continue;
+        }
+
+        if (trackedTextBlock == textBlock) {
+            textBlock.Foreground(wuxm::SolidColorBrush{color});
+            return;
+        }
+
+        ++it;
+    }
+
+    auto dependencyObject = textBlock.as<wux::DependencyObject>();
+    g_trayTextBlockStates.push_back({
+        .textBlock = winrt::make_weak(textBlock),
+        .originalForeground = dependencyObject.ReadLocalValue(
+            wuxc::TextBlock::ForegroundProperty()),
+    });
+
+    textBlock.Foreground(wuxm::SolidColorBrush{color});
+}
+
+void ApplyTrayTextColorInSubtree(wux::FrameworkElement element,
+                                 wui::Color color) {
+    if (!element) {
+        return;
+    }
+
+    if (winrt::get_class_name(element) == L"SystemTray.ChevronIconView") {
+        return;
+    }
+
+    if (auto textBlock = element.try_as<wuxc::TextBlock>()) {
+        ApplyTrayTextColorToTextBlock(textBlock, color);
+    }
+
+    int childrenCount = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i)
+                         .try_as<wux::FrameworkElement>();
+        if (child) {
+            ApplyTrayTextColorInSubtree(child, color);
+        }
+    }
+}
+
+void ApplySystemTrayTextColor(wux::FrameworkElement taskbarRoot) {
+    TrayTextColorSnapshot settings = GetTrayTextColorSnapshot();
+    if (g_unloading || !settings.enabled) {
+        RestoreTrayTextColors();
+        return;
+    }
+
+    wui::Color color;
+    try {
+        color = wuxmk::XamlBindingHelper::ConvertValue(
+                    winrt::xaml_typename<wui::Color>(),
+                    winrt::box_value(settings.color))
+                    .as<wui::Color>();
+    } catch (...) {
+        Wh_Log(L"Invalid system tray text color \"%s\": %08X",
+               settings.color.c_str(), winrt::to_hresult());
+        RestoreTrayTextColors();
+        return;
+    }
+
+    auto systemTrayFrame = FindDescendantByClassName(
+        taskbarRoot, L"SystemTray.SystemTrayFrame");
+    if (!systemTrayFrame) {
+        Wh_Log(L"SystemTrayFrame wasn't found");
+        return;
+    }
+
+    ApplyTrayTextColorInSubtree(systemTrayFrame, color);
+}
+
 void ClearTooltipsInSubtree(wux::FrameworkElement element) {
     if (!element) {
         return;
@@ -494,6 +674,8 @@ wux::FrameworkElement GetClockButtonElement(HWND taskbarWnd) {
     if (!root) {
         return nullptr;
     }
+
+    ApplySystemTrayTextColor(root);
 
     auto clockButton = FindDescendantByName(root, L"NotificationCenterButton");
     if (!clockButton ||
@@ -740,7 +922,7 @@ LRESULT CALLBACK InputSiteWindowProc_Hook(HWND hWnd,
     return InputSiteWindowProc_Original(hWnd, msg, wParam, lParam);
 }
 
-void ApplyClockTooltipSettingsForTaskbar(HWND taskbarWnd) {
+void ApplyTaskbarSettingsForTaskbar(HWND taskbarWnd) {
     GetClockButtonElement(taskbarWnd);
 }
 
@@ -793,12 +975,12 @@ bool RunFromWindowThread(HWND hWnd,
     return true;
 }
 
-void ApplyClockTooltipSettings() {
+void ApplyTaskbarSettings() {
     for (HWND taskbarWnd : FindCurrentProcessTaskbarWindows()) {
         RunFromWindowThread(
             taskbarWnd,
             [](void* param) {
-                ApplyClockTooltipSettingsForTaskbar((HWND)param);
+                ApplyTaskbarSettingsForTaskbar((HWND)param);
             },
             taskbarWnd);
     }
@@ -827,7 +1009,7 @@ void HandleIdentifiedInputSiteWindow(HWND hWnd) {
         RunFromWindowThread(
             taskbarWnd,
             [](void* param) {
-                ApplyClockTooltipSettingsForTaskbar((HWND)param);
+                ApplyTaskbarSettingsForTaskbar((HWND)param);
             },
             taskbarWnd);
         return;
@@ -860,7 +1042,7 @@ void HandleIdentifiedInputSiteWindow(HWND hWnd) {
     RunFromWindowThread(
         taskbarWnd,
         [](void* param) {
-            ApplyClockTooltipSettingsForTaskbar((HWND)param);
+            ApplyTaskbarSettingsForTaskbar((HWND)param);
         },
         taskbarWnd);
 }
@@ -931,7 +1113,7 @@ void StartStartupRetryTimer() {
             }
 
             FindAndHookExistingInputSites();
-            ApplyClockTooltipSettings();
+            ApplyTaskbarSettings();
 
             int attempts = g_startupRetryAttempts.fetch_add(
                                1, std::memory_order_relaxed) +
@@ -1200,8 +1382,16 @@ void Wh_ModAfterInit() {
     Wh_Log(L">");
 
     FindAndHookExistingInputSites();
-    ApplyClockTooltipSettings();
+    ApplyTaskbarSettings();
     StartStartupRetryTimer();
+}
+
+void Wh_ModBeforeUninit() {
+    Wh_Log(L">");
+
+    g_unloading = true;
+    StopStartupRetryTimer();
+    ApplyTaskbarSettings();
 }
 
 void Wh_ModUninit() {
@@ -1214,5 +1404,5 @@ void Wh_ModSettingsChanged() {
     Wh_Log(L">");
 
     LoadSettings();
-    ApplyClockTooltipSettings();
+    ApplyTaskbarSettings();
 }
