@@ -1,0 +1,1218 @@
+// ==WindhawkMod==
+// @id              clock-click-actions
+// @name            Clock click actions
+// @description     Configure left, middle and right click actions for the Windows 11 taskbar clock
+// @version         0.4
+// @author          roosmsg
+// @github          https://github.com/roosmsg
+// @include         explorer.exe
+// @architecture    x86-64
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshell32 -lversion
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Clock click actions
+
+Configure what happens when the Windows 11 taskbar clock is clicked with the
+left, middle, or right mouse button.
+
+Supported actions:
+
+- Open Quick Settings.
+- Open Notifications.
+- Open an application, path, or URL.
+- Do nothing.
+
+The clock tooltip is hidden while the mod is active.
+
+This mod targets the Windows 11 taskbar clock/notification button only. It
+doesn't support the legacy Windows 10 taskbar.
+
+For custom targets, use values such as `notepad.exe`,
+`C:\Windows\System32\calc.exe`, `C:\Users\Public`, `https://example.com`, or a
+Windows URI such as `ms-settings:`.
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- leftClickAction: openNotifications
+  $name: Left click action
+  $options:
+  - openQuickSettings: Open Quick Settings
+  - openNotifications: Open Notifications
+  - openTarget: Open application, path or URL
+  - doNothing: Do nothing
+- leftClickTarget: ""
+  $name: Left click application, path or URL
+  $description: Used when the left click action is "Open application, path or URL".
+- middleClickAction: doNothing
+  $name: Middle click action
+  $options:
+  - openQuickSettings: Open Quick Settings
+  - openNotifications: Open Notifications
+  - openTarget: Open application, path or URL
+  - doNothing: Do nothing
+- middleClickTarget: ""
+  $name: Middle click application, path or URL
+  $description: Used when the middle click action is "Open application, path or URL".
+- rightClickAction: openQuickSettings
+  $name: Right click action
+  $options:
+  - openQuickSettings: Open Quick Settings
+  - openNotifications: Open Notifications
+  - openTarget: Open application, path or URL
+  - doNothing: Do nothing
+- rightClickTarget: ""
+  $name: Right click application, path or URL
+  $description: Used when the right click action is "Open application, path or URL".
+*/
+// ==/WindhawkModSettings==
+
+#include <windhawk_utils.h>
+
+#include <shellapi.h>
+#include <windows.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#undef GetCurrentTime
+
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/base.h>
+
+namespace wf = winrt::Windows::Foundation;
+namespace wux = winrt::Windows::UI::Xaml;
+namespace wuxc = winrt::Windows::UI::Xaml::Controls;
+namespace wuxm = winrt::Windows::UI::Xaml::Media;
+
+enum class ClickAction {
+    OpenQuickSettings,
+    OpenNotifications,
+    OpenTarget,
+    DoNothing,
+};
+
+enum class MouseButton {
+    None,
+    Left,
+    Middle,
+    Right,
+};
+
+struct Settings {
+    ClickAction leftClickAction = ClickAction::OpenNotifications;
+    std::wstring leftClickTarget;
+    ClickAction middleClickAction = ClickAction::DoNothing;
+    std::wstring middleClickTarget;
+    ClickAction rightClickAction = ClickAction::OpenQuickSettings;
+    std::wstring rightClickTarget;
+};
+
+Settings g_settings;
+std::mutex g_settingsMutex;
+
+std::atomic<bool> g_initialized;
+std::atomic<bool> g_inputSiteProcHooked;
+std::atomic<UINT32> g_suppressedPointerId;
+std::atomic<MouseButton> g_suppressedMouseButton{MouseButton::None};
+std::atomic<DWORD> g_blockMouseDownUntil;
+std::atomic<DWORD> g_blockContextMenuUntil;
+std::atomic<int> g_startupRetryAttempts;
+
+DWORD g_taskbarThreadId;
+PTP_TIMER g_startupRetryTimer;
+
+constexpr DWORD kStartupRetryIntervalMs = 1000;
+constexpr int kStartupRetryMaxAttempts = 30;
+
+void* CTaskBand_ITaskListWndSite_vftable;
+
+using CTaskBand_GetTaskbarHost_t = void*(WINAPI*)(void* pThis, void** result);
+CTaskBand_GetTaskbarHost_t CTaskBand_GetTaskbarHost_Original;
+
+void* TaskbarHost_FrameHeight_Original;
+
+using std__Ref_count_base__Decref_t = void(WINAPI*)(void* pThis);
+std__Ref_count_base__Decref_t std__Ref_count_base__Decref_Original;
+
+WNDPROC InputSiteWindowProc_Original;
+
+ClickAction ReadActionSetting(PCWSTR settingName,
+                              ClickAction defaultAction) {
+    PCWSTR value = Wh_GetStringSetting(settingName);
+
+    ClickAction result = defaultAction;
+    if (wcscmp(value, L"openQuickSettings") == 0) {
+        result = ClickAction::OpenQuickSettings;
+    } else if (wcscmp(value, L"openNotifications") == 0) {
+        result = ClickAction::OpenNotifications;
+    } else if (wcscmp(value, L"openTarget") == 0) {
+        result = ClickAction::OpenTarget;
+    } else if (wcscmp(value, L"doNothing") == 0) {
+        result = ClickAction::DoNothing;
+    }
+
+    Wh_FreeStringSetting(value);
+    return result;
+}
+
+std::wstring ReadStringSetting(PCWSTR settingName) {
+    PCWSTR value = Wh_GetStringSetting(settingName);
+    std::wstring result = value;
+    Wh_FreeStringSetting(value);
+    return result;
+}
+
+void LoadSettings() {
+    Settings settings;
+    settings.leftClickAction =
+        ReadActionSetting(L"leftClickAction", ClickAction::OpenNotifications);
+    settings.leftClickTarget = ReadStringSetting(L"leftClickTarget");
+    settings.middleClickAction =
+        ReadActionSetting(L"middleClickAction", ClickAction::DoNothing);
+    settings.middleClickTarget = ReadStringSetting(L"middleClickTarget");
+    settings.rightClickAction =
+        ReadActionSetting(L"rightClickAction", ClickAction::OpenQuickSettings);
+    settings.rightClickTarget = ReadStringSetting(L"rightClickTarget");
+
+    std::lock_guard<std::mutex> guard(g_settingsMutex);
+    g_settings = std::move(settings);
+}
+
+struct ClickActionSnapshot {
+    ClickAction action;
+    std::wstring target;
+};
+
+ClickActionSnapshot GetActionSnapshot(MouseButton button) {
+    std::lock_guard<std::mutex> guard(g_settingsMutex);
+
+    if (button == MouseButton::Right) {
+        return {g_settings.rightClickAction, g_settings.rightClickTarget};
+    }
+
+    if (button == MouseButton::Middle) {
+        return {g_settings.middleClickAction, g_settings.middleClickTarget};
+    }
+
+    return {g_settings.leftClickAction, g_settings.leftClickTarget};
+}
+
+PCWSTR MouseButtonName(MouseButton button) {
+    switch (button) {
+        case MouseButton::Left:
+            return L"Left";
+
+        case MouseButton::Middle:
+            return L"Middle";
+
+        case MouseButton::Right:
+            return L"Right";
+
+        default:
+            return L"Unknown";
+    }
+}
+
+void SendWindowsShortcut(WORD virtualKey) {
+    INPUT inputs[4]{};
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_LWIN;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = virtualKey;
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = virtualKey;
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_LWIN;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    if (SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT)) !=
+        ARRAYSIZE(inputs)) {
+        Wh_Log(L"SendInput failed: %u", GetLastError());
+    }
+}
+
+std::wstring ExpandTarget(std::wstring_view target) {
+    if (target.empty()) {
+        return {};
+    }
+
+    std::wstring source(target);
+    DWORD required = ExpandEnvironmentStringsW(source.c_str(), nullptr, 0);
+    if (required == 0) {
+        return source;
+    }
+
+    std::wstring expanded(required, L'\0');
+    DWORD copied = ExpandEnvironmentStringsW(source.c_str(), expanded.data(),
+                                             required);
+    if (copied == 0 || copied > required) {
+        return source;
+    }
+
+    if (!expanded.empty() && expanded.back() == L'\0') {
+        expanded.pop_back();
+    }
+
+    return expanded;
+}
+
+void OpenTarget(std::wstring_view target) {
+    std::wstring expandedTarget = ExpandTarget(target);
+    if (expandedTarget.empty()) {
+        Wh_Log(L"Custom target is empty");
+        return;
+    }
+
+    HINSTANCE result = ShellExecuteW(nullptr, L"open", expandedTarget.c_str(),
+                                     nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32) {
+        Wh_Log(L"ShellExecute failed for \"%s\": %d", expandedTarget.c_str(),
+               (int)(INT_PTR)result);
+    }
+}
+
+void ExecuteAction(MouseButton button) {
+    ClickActionSnapshot snapshot = GetActionSnapshot(button);
+
+    switch (snapshot.action) {
+        case ClickAction::OpenQuickSettings:
+            SendWindowsShortcut(L'A');
+            break;
+
+        case ClickAction::OpenNotifications:
+            SendWindowsShortcut(L'N');
+            break;
+
+        case ClickAction::OpenTarget:
+            OpenTarget(snapshot.target);
+            break;
+
+        case ClickAction::DoNothing:
+            break;
+    }
+}
+
+bool IsTaskbarWindow(HWND hWnd) {
+    WCHAR className[64];
+    if (!GetClassName(hWnd, className, ARRAYSIZE(className))) {
+        return false;
+    }
+
+    return _wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+           _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND taskbarWnd = nullptr;
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            DWORD processId = 0;
+            WCHAR className[64];
+            if (GetWindowThreadProcessId(hWnd, &processId) &&
+                processId == GetCurrentProcessId() &&
+                GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hWnd;
+                return FALSE;
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&taskbarWnd));
+
+    return taskbarWnd;
+}
+
+std::vector<HWND> FindCurrentProcessTaskbarWindows() {
+    std::vector<HWND> result;
+
+    HWND primaryTaskbar = FindCurrentProcessTaskbarWnd();
+    if (!primaryTaskbar) {
+        return result;
+    }
+
+    result.push_back(primaryTaskbar);
+
+    DWORD taskbarThreadId = GetWindowThreadProcessId(primaryTaskbar, nullptr);
+    if (!taskbarThreadId) {
+        return result;
+    }
+
+    EnumThreadWindows(
+        taskbarThreadId,
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            WCHAR className[64];
+            if (GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0) {
+                auto taskbars = reinterpret_cast<std::vector<HWND>*>(lParam);
+                taskbars->push_back(hWnd);
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&result));
+
+    return result;
+}
+
+wux::FrameworkElement FindDescendantByName(wux::FrameworkElement element,
+                                           PCWSTR name) {
+    if (!element) {
+        return nullptr;
+    }
+
+    if (element.Name() == name) {
+        return element;
+    }
+
+    int childrenCount = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i)
+                         .try_as<wux::FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+
+        if (auto result = FindDescendantByName(child, name)) {
+            return result;
+        }
+    }
+
+    return nullptr;
+}
+
+void ClearTooltipsInSubtree(wux::FrameworkElement element) {
+    if (!element) {
+        return;
+    }
+
+    wuxc::ToolTipService::SetToolTip(
+        element, winrt::Windows::Foundation::IInspectable{nullptr});
+
+    int childrenCount = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i)
+                         .try_as<wux::FrameworkElement>();
+        if (child) {
+            ClearTooltipsInSubtree(child);
+        }
+    }
+}
+
+wux::XamlRoot GetTaskbarXamlRoot(HWND taskbarWnd) {
+    HWND taskSwWnd = (HWND)GetProp(taskbarWnd, L"TaskbandHWND");
+    if (!taskSwWnd) {
+        return nullptr;
+    }
+
+    void* taskBand = (void*)GetWindowLongPtr(taskSwWnd, 0);
+    if (!taskBand) {
+        return nullptr;
+    }
+
+    void* taskBandForTaskListWndSite = taskBand;
+    for (int i = 0; *(void**)taskBandForTaskListWndSite !=
+                    CTaskBand_ITaskListWndSite_vftable;
+         i++) {
+        if (i == 20) {
+            return nullptr;
+        }
+
+        taskBandForTaskListWndSite = (void**)taskBandForTaskListWndSite + 1;
+    }
+
+    void* taskbarHostSharedPtr[2]{};
+    CTaskBand_GetTaskbarHost_Original(taskBandForTaskListWndSite,
+                                      taskbarHostSharedPtr);
+    if (!taskbarHostSharedPtr[0] && !taskbarHostSharedPtr[1]) {
+        return nullptr;
+    }
+
+    size_t taskbarElementIUnknownOffset = 0x48;
+
+#if defined(_M_X64)
+    {
+        const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
+        if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[4] == 0x48 &&
+            b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
+            taskbarElementIUnknownOffset = b[7];
+        } else {
+            Wh_Log(L"Unsupported TaskbarHost::FrameHeight");
+        }
+    }
+#else
+#error "Unsupported architecture"
+#endif
+
+    auto* taskbarElementIUnknown =
+        *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] +
+                      taskbarElementIUnknownOffset);
+
+    wux::FrameworkElement taskbarElement = nullptr;
+    if (taskbarElementIUnknown) {
+        taskbarElementIUnknown->QueryInterface(
+            winrt::guid_of<wux::FrameworkElement>(),
+            winrt::put_abi(taskbarElement));
+    }
+
+    wux::XamlRoot result = taskbarElement ? taskbarElement.XamlRoot() : nullptr;
+
+    if (taskbarHostSharedPtr[1]) {
+        std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
+    }
+
+    return result;
+}
+
+wux::FrameworkElement GetClockButtonElement(HWND taskbarWnd) {
+    wux::XamlRoot xamlRoot = GetTaskbarXamlRoot(taskbarWnd);
+    if (!xamlRoot) {
+        return nullptr;
+    }
+
+    auto root = xamlRoot.Content().try_as<wux::FrameworkElement>();
+    if (!root) {
+        return nullptr;
+    }
+
+    auto clockButton = FindDescendantByName(root, L"NotificationCenterButton");
+    if (!clockButton ||
+        winrt::get_class_name(clockButton) != L"SystemTray.OmniButton") {
+        return nullptr;
+    }
+
+    ClearTooltipsInSubtree(clockButton);
+    return clockButton;
+}
+
+bool GetElementScreenRect(wux::FrameworkElement element,
+                          HWND hostWnd,
+                          RECT* rect) {
+    if (!element || !hostWnd) {
+        return false;
+    }
+
+    double width = element.ActualWidth();
+    double height = element.ActualHeight();
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    auto xamlRoot = element.XamlRoot();
+    auto rootElement = xamlRoot.Content().try_as<wux::UIElement>();
+    if (!rootElement) {
+        return false;
+    }
+
+    auto transform = element.TransformToVisual(rootElement);
+    wf::Point topLeft = transform.TransformPoint({0, 0});
+    wf::Point bottomRight =
+        transform.TransformPoint({(float)width, (float)height});
+
+    double scale = xamlRoot.RasterizationScale();
+    double left = std::min(topLeft.X, bottomRight.X) * scale;
+    double top = std::min(topLeft.Y, bottomRight.Y) * scale;
+    double right = std::max(topLeft.X, bottomRight.X) * scale;
+    double bottom = std::max(topLeft.Y, bottomRight.Y) * scale;
+
+    RECT hostRect;
+    if (!GetWindowRect(hostWnd, &hostRect)) {
+        return false;
+    }
+
+    rect->left = hostRect.left + (LONG)std::floor(left);
+    rect->top = hostRect.top + (LONG)std::floor(top);
+    rect->right = hostRect.left + (LONG)std::ceil(right);
+    rect->bottom = hostRect.top + (LONG)std::ceil(bottom);
+    return rect->right > rect->left && rect->bottom > rect->top;
+}
+
+bool IsPointInClockButton(HWND inputSiteWnd, POINT screenPt) {
+    HWND bridgeWnd = GetParent(inputSiteWnd);
+    HWND taskbarWnd = bridgeWnd ? GetParent(bridgeWnd) : nullptr;
+    if (!taskbarWnd || !IsTaskbarWindow(taskbarWnd)) {
+        return false;
+    }
+
+    wux::FrameworkElement clockButton = GetClockButtonElement(taskbarWnd);
+    if (!clockButton) {
+        return false;
+    }
+
+    RECT clockRect;
+    if (!GetElementScreenRect(clockButton, bridgeWnd, &clockRect)) {
+        return false;
+    }
+
+    return PtInRect(&clockRect, screenPt);
+}
+
+bool GetPointerScreenPoint(WPARAM wParam, LPARAM lParam, HWND hWnd, POINT* pt) {
+    UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+
+    POINTER_INFO pointerInfo;
+    if (GetPointerInfo(pointerId, &pointerInfo)) {
+        *pt = pointerInfo.ptPixelLocation;
+        return true;
+    }
+
+    pt->x = GET_X_LPARAM(lParam);
+    pt->y = GET_Y_LPARAM(lParam);
+    return ClientToScreen(hWnd, pt);
+}
+
+MouseButton GetPointerButton(WPARAM wParam) {
+    if (IS_POINTER_FIRSTBUTTON_WPARAM(wParam)) {
+        return MouseButton::Left;
+    }
+
+    if (IS_POINTER_SECONDBUTTON_WPARAM(wParam)) {
+        return MouseButton::Right;
+    }
+
+    if (IS_POINTER_THIRDBUTTON_WPARAM(wParam)) {
+        return MouseButton::Middle;
+    }
+
+    return MouseButton::None;
+}
+
+bool HandlePointerDown(HWND hWnd, WPARAM wParam, LPARAM lParam) {
+    MouseButton button = GetPointerButton(wParam);
+    if (button == MouseButton::None) {
+        return false;
+    }
+
+    POINT screenPt;
+    if (!GetPointerScreenPoint(wParam, lParam, hWnd, &screenPt)) {
+        return false;
+    }
+
+    if (!IsPointInClockButton(hWnd, screenPt)) {
+        return false;
+    }
+
+    UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+    g_suppressedPointerId.store(pointerId, std::memory_order_relaxed);
+    g_suppressedMouseButton.store(button, std::memory_order_relaxed);
+    g_blockMouseDownUntil.store(GetTickCount() + 200,
+                                std::memory_order_relaxed);
+    if (button == MouseButton::Right) {
+        g_blockContextMenuUntil.store(GetTickCount() + 1000,
+                                      std::memory_order_relaxed);
+    }
+
+    Wh_Log(L"%s click", MouseButtonName(button));
+    ExecuteAction(button);
+    return true;
+}
+
+bool HandlePointerUp(WPARAM wParam) {
+    UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+    return pointerId != 0 &&
+           pointerId == g_suppressedPointerId.exchange(
+                            0, std::memory_order_relaxed);
+}
+
+bool HandleMouseDown(HWND hWnd,
+                     MouseButton button,
+                     LPARAM lParam) {
+    POINT screenPt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    if (!ClientToScreen(hWnd, &screenPt)) {
+        return false;
+    }
+
+    if (!IsPointInClockButton(hWnd, screenPt)) {
+        return false;
+    }
+
+    g_suppressedMouseButton.store(button, std::memory_order_relaxed);
+    if (button == MouseButton::Right) {
+        g_blockContextMenuUntil.store(GetTickCount() + 1000,
+                                      std::memory_order_relaxed);
+    }
+
+    Wh_Log(L"%s mouse click", MouseButtonName(button));
+    ExecuteAction(button);
+    return true;
+}
+
+bool HandleMouseUp(MouseButton button) {
+    return button == g_suppressedMouseButton.exchange(
+                         MouseButton::None, std::memory_order_relaxed);
+}
+
+LRESULT CALLBACK InputSiteWindowProc_Hook(HWND hWnd,
+                                          UINT msg,
+                                          WPARAM wParam,
+                                          LPARAM lParam) {
+    switch (msg) {
+        case WM_POINTERDOWN:
+            if (HandlePointerDown(hWnd, wParam, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_POINTERUP:
+            if (HandlePointerUp(wParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_LBUTTONDOWN:
+            if ((LONG)(g_blockMouseDownUntil.load(std::memory_order_relaxed) -
+                       GetTickCount()) > 0) {
+                return 0;
+            }
+            if (HandleMouseDown(hWnd, MouseButton::Left, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_RBUTTONDOWN:
+            if ((LONG)(g_blockMouseDownUntil.load(std::memory_order_relaxed) -
+                       GetTickCount()) > 0) {
+                return 0;
+            }
+            if (HandleMouseDown(hWnd, MouseButton::Right, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_MBUTTONDOWN:
+            if ((LONG)(g_blockMouseDownUntil.load(std::memory_order_relaxed) -
+                       GetTickCount()) > 0) {
+                return 0;
+            }
+            if (HandleMouseDown(hWnd, MouseButton::Middle, lParam)) {
+                return 0;
+            }
+            break;
+
+        case WM_LBUTTONUP:
+            if (HandleMouseUp(MouseButton::Left)) {
+                return 0;
+            }
+            break;
+
+        case WM_RBUTTONUP:
+            if (HandleMouseUp(MouseButton::Right)) {
+                return 0;
+            }
+            break;
+
+        case WM_MBUTTONUP:
+            if (HandleMouseUp(MouseButton::Middle)) {
+                return 0;
+            }
+            break;
+
+        case WM_CONTEXTMENU: {
+            DWORD blockUntil =
+                g_blockContextMenuUntil.load(std::memory_order_relaxed);
+            if (blockUntil && (LONG)(blockUntil - GetTickCount()) > 0) {
+                return 0;
+            }
+            break;
+        }
+    }
+
+    return InputSiteWindowProc_Original(hWnd, msg, wParam, lParam);
+}
+
+void ApplyClockTooltipSettingsForTaskbar(HWND taskbarWnd) {
+    GetClockButtonElement(taskbarWnd);
+}
+
+using RunFromWindowThreadProc_t = void(WINAPI*)(void* parameter);
+
+bool RunFromWindowThread(HWND hWnd,
+                         RunFromWindowThreadProc_t proc,
+                         void* procParam) {
+    static const UINT runFromWindowThreadRegisteredMsg =
+        RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct RUN_FROM_WINDOW_THREAD_PARAM {
+        RunFromWindowThreadProc_t proc;
+        void* procParam;
+    };
+
+    DWORD threadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (!threadId) {
+        return false;
+    }
+
+    if (threadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookEx(
+        WH_CALLWNDPROC,
+        [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (nCode == HC_ACTION) {
+                const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
+                if (cwp->message == runFromWindowThreadRegisteredMsg) {
+                    auto* param =
+                        (RUN_FROM_WINDOW_THREAD_PARAM*)cwp->lParam;
+                    param->proc(param->procParam);
+                }
+            }
+
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        },
+        nullptr, threadId);
+    if (!hook) {
+        return false;
+    }
+
+    RUN_FROM_WINDOW_THREAD_PARAM param{proc, procParam};
+    SendMessage(hWnd, runFromWindowThreadRegisteredMsg, 0, (LPARAM)&param);
+
+    UnhookWindowsHookEx(hook);
+    return true;
+}
+
+void ApplyClockTooltipSettings() {
+    for (HWND taskbarWnd : FindCurrentProcessTaskbarWindows()) {
+        RunFromWindowThread(
+            taskbarWnd,
+            [](void* param) {
+                ApplyClockTooltipSettingsForTaskbar((HWND)param);
+            },
+            taskbarWnd);
+    }
+}
+
+void HandleIdentifiedInputSiteWindow(HWND hWnd) {
+    HWND bridgeWnd = GetParent(hWnd);
+    WCHAR className[64];
+    if (!bridgeWnd || !GetClassName(bridgeWnd, className, ARRAYSIZE(className)) ||
+        _wcsicmp(className,
+                 L"Windows.UI.Composition.DesktopWindowContentBridge") != 0) {
+        return;
+    }
+
+    HWND taskbarWnd = GetParent(bridgeWnd);
+    if (!taskbarWnd || !IsTaskbarWindow(taskbarWnd)) {
+        return;
+    }
+
+    DWORD threadId = GetWindowThreadProcessId(taskbarWnd, nullptr);
+    if (!threadId) {
+        return;
+    }
+
+    if (g_inputSiteProcHooked) {
+        RunFromWindowThread(
+            taskbarWnd,
+            [](void* param) {
+                ApplyClockTooltipSettingsForTaskbar((HWND)param);
+            },
+            taskbarWnd);
+        return;
+    }
+
+    if (!g_taskbarThreadId) {
+        g_taskbarThreadId = threadId;
+    } else if (g_taskbarThreadId != threadId) {
+        return;
+    }
+
+    void* wndProc = (void*)GetWindowLongPtr(hWnd, GWLP_WNDPROC);
+    if (!wndProc) {
+        return;
+    }
+
+    if (!Wh_SetFunctionHook(wndProc, (void*)InputSiteWindowProc_Hook,
+                            (void**)&InputSiteWindowProc_Original)) {
+        Wh_Log(L"Failed to hook InputSite wndproc");
+        return;
+    }
+
+    g_inputSiteProcHooked = true;
+    Wh_Log(L"Hooked InputSite wndproc");
+
+    if (g_initialized) {
+        Wh_ApplyHookOperations();
+    }
+
+    RunFromWindowThread(
+        taskbarWnd,
+        [](void* param) {
+            ApplyClockTooltipSettingsForTaskbar((HWND)param);
+        },
+        taskbarWnd);
+}
+
+void FindAndHookInputSiteForTaskbar(HWND taskbarWnd) {
+    HWND bridgeWnd = FindWindowEx(
+        taskbarWnd, nullptr,
+        L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
+    if (!bridgeWnd) {
+        return;
+    }
+
+    HWND inputSiteWnd = FindWindowEx(
+        bridgeWnd, nullptr, L"Windows.UI.Input.InputSite.WindowClass",
+        nullptr);
+    if (inputSiteWnd) {
+        HandleIdentifiedInputSiteWindow(inputSiteWnd);
+    }
+}
+
+void FindAndHookExistingInputSites() {
+    for (HWND taskbarWnd : FindCurrentProcessTaskbarWindows()) {
+        FindAndHookInputSiteForTaskbar(taskbarWnd);
+    }
+}
+
+void ApplyStartupRetryTimer() {
+    if (!g_startupRetryTimer) {
+        return;
+    }
+
+    LONGLONG dueTime100Ns =
+        -static_cast<LONGLONG>(kStartupRetryIntervalMs) * 10000;
+
+    ULARGE_INTEGER dueTime;
+    dueTime.QuadPart = static_cast<ULONGLONG>(dueTime100Ns);
+
+    FILETIME dueTimeFt;
+    dueTimeFt.dwLowDateTime = dueTime.LowPart;
+    dueTimeFt.dwHighDateTime = dueTime.HighPart;
+
+    SetThreadpoolTimer(g_startupRetryTimer, &dueTimeFt,
+                       kStartupRetryIntervalMs, 0);
+}
+
+void StopStartupRetryTimer() {
+    if (!g_startupRetryTimer) {
+        return;
+    }
+
+    SetThreadpoolTimer(g_startupRetryTimer, nullptr, 0, 0);
+    WaitForThreadpoolTimerCallbacks(g_startupRetryTimer, TRUE);
+    CloseThreadpoolTimer(g_startupRetryTimer);
+    g_startupRetryTimer = nullptr;
+}
+
+void StartStartupRetryTimer() {
+    if (g_inputSiteProcHooked || g_startupRetryTimer) {
+        return;
+    }
+
+    g_startupRetryAttempts.store(0, std::memory_order_relaxed);
+    g_startupRetryTimer = CreateThreadpoolTimer(
+        [](PTP_CALLBACK_INSTANCE, void*, PTP_TIMER timer) {
+            if (g_inputSiteProcHooked) {
+                SetThreadpoolTimer(timer, nullptr, 0, 0);
+                return;
+            }
+
+            FindAndHookExistingInputSites();
+            ApplyClockTooltipSettings();
+
+            int attempts = g_startupRetryAttempts.fetch_add(
+                               1, std::memory_order_relaxed) +
+                           1;
+            if (g_inputSiteProcHooked ||
+                attempts >= kStartupRetryMaxAttempts) {
+                SetThreadpoolTimer(timer, nullptr, 0, 0);
+            }
+        },
+        nullptr, nullptr);
+    if (!g_startupRetryTimer) {
+        Wh_Log(L"Failed to create startup retry timer");
+        return;
+    }
+
+    ApplyStartupRetryTimer();
+}
+
+void HandleCreatedWindow(HWND hWnd) {
+    if (!hWnd) {
+        return;
+    }
+
+    WCHAR createdClassName[64];
+    if (!GetClassName(hWnd, createdClassName, ARRAYSIZE(createdClassName))) {
+        return;
+    }
+
+    if (_wcsicmp(createdClassName,
+                 L"Windows.UI.Input.InputSite.WindowClass") == 0) {
+        HandleIdentifiedInputSiteWindow(hWnd);
+    } else if (_wcsicmp(createdClassName,
+                        L"Windows.UI.Composition.DesktopWindowContentBridge") ==
+               0) {
+        HWND taskbarWnd = GetParent(hWnd);
+        if (taskbarWnd && IsTaskbarWindow(taskbarWnd)) {
+            FindAndHookInputSiteForTaskbar(taskbarWnd);
+        }
+    } else if (_wcsicmp(createdClassName, L"Shell_TrayWnd") == 0 ||
+               _wcsicmp(createdClassName, L"Shell_SecondaryTrayWnd") == 0) {
+        FindAndHookInputSiteForTaskbar(hWnd);
+    }
+}
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
+                                 LPCWSTR className,
+                                 LPCWSTR windowName,
+                                 DWORD style,
+                                 int x,
+                                 int y,
+                                 int width,
+                                 int height,
+                                 HWND wndParent,
+                                 HMENU menu,
+                                 HINSTANCE instance,
+                                 LPVOID param) {
+    HWND hWnd = CreateWindowExW_Original(
+        exStyle, className, windowName, style, x, y, width, height, wndParent,
+        menu, instance, param);
+    if (!hWnd) {
+        return hWnd;
+    }
+
+    HandleCreatedWindow(hWnd);
+
+    return hWnd;
+}
+
+using CreateWindowInBand_t = HWND(WINAPI*)(DWORD exStyle,
+                                           LPCWSTR className,
+                                           LPCWSTR windowName,
+                                           DWORD style,
+                                           int x,
+                                           int y,
+                                           int width,
+                                           int height,
+                                           HWND wndParent,
+                                           HMENU menu,
+                                           HINSTANCE instance,
+                                           LPVOID param,
+                                           DWORD band);
+CreateWindowInBand_t CreateWindowInBand_Original;
+HWND WINAPI CreateWindowInBand_Hook(DWORD exStyle,
+                                    LPCWSTR className,
+                                    LPCWSTR windowName,
+                                    DWORD style,
+                                    int x,
+                                    int y,
+                                    int width,
+                                    int height,
+                                    HWND wndParent,
+                                    HMENU menu,
+                                    HINSTANCE instance,
+                                    LPVOID param,
+                                    DWORD band) {
+    HWND hWnd = CreateWindowInBand_Original(
+        exStyle, className, windowName, style, x, y, width, height, wndParent,
+        menu, instance, param, band);
+
+    HandleCreatedWindow(hWnd);
+    return hWnd;
+}
+
+using CreateWindowInBandEx_t = HWND(WINAPI*)(DWORD exStyle,
+                                             LPCWSTR className,
+                                             LPCWSTR windowName,
+                                             DWORD style,
+                                             int x,
+                                             int y,
+                                             int width,
+                                             int height,
+                                             HWND wndParent,
+                                             HMENU menu,
+                                             HINSTANCE instance,
+                                             LPVOID param,
+                                             DWORD band,
+                                             DWORD typeFlags);
+CreateWindowInBandEx_t CreateWindowInBandEx_Original;
+HWND WINAPI CreateWindowInBandEx_Hook(DWORD exStyle,
+                                      LPCWSTR className,
+                                      LPCWSTR windowName,
+                                      DWORD style,
+                                      int x,
+                                      int y,
+                                      int width,
+                                      int height,
+                                      HWND wndParent,
+                                      HMENU menu,
+                                      HINSTANCE instance,
+                                      LPVOID param,
+                                      DWORD band,
+                                      DWORD typeFlags) {
+    HWND hWnd = CreateWindowInBandEx_Original(
+        exStyle, className, windowName, style, x, y, width, height, wndParent,
+        menu, instance, param, band, typeFlags);
+
+    HandleCreatedWindow(hWnd);
+    return hWnd;
+}
+
+bool HookTaskbarDllSymbols() {
+    HMODULE module =
+        LoadLibraryEx(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+        Wh_Log(L"Failed to load taskbar.dll");
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(const CTaskBand::`vftable'{for `ITaskListWndSite'})"},
+            &CTaskBand_ITaskListWndSite_vftable,
+        },
+        {
+            {LR"(public: virtual class std::shared_ptr<class TaskbarHost> __cdecl CTaskBand::GetTaskbarHost(void)const )"},
+            &CTaskBand_GetTaskbarHost_Original,
+        },
+        {
+            {LR"(public: int __cdecl TaskbarHost::FrameHeight(void)const )"},
+            &TaskbarHost_FrameHeight_Original,
+        },
+        {
+            {LR"(public: void __cdecl std::_Ref_count_base::_Decref(void))"},
+            &std__Ref_count_base__Decref_Original,
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(module, symbolHooks,
+                                    ARRAYSIZE(symbolHooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    return true;
+}
+
+VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE module) {
+    HRSRC resource =
+        FindResource(module, MAKEINTRESOURCE(VS_VERSION_INFO), RT_VERSION);
+    if (!resource) {
+        return nullptr;
+    }
+
+    HGLOBAL global = LoadResource(module, resource);
+    if (!global) {
+        return nullptr;
+    }
+
+    void* data = LockResource(global);
+    if (!data) {
+        return nullptr;
+    }
+
+    void* fixedFileInfo = nullptr;
+    UINT fixedFileInfoLen = 0;
+    if (!VerQueryValue(data, L"\\", &fixedFileInfo, &fixedFileInfoLen) ||
+        fixedFileInfoLen == 0) {
+        return nullptr;
+    }
+
+    return (VS_FIXEDFILEINFO*)fixedFileInfo;
+}
+
+bool IsWindows11() {
+    VS_FIXEDFILEINFO* fixedFileInfo = GetModuleVersionInfo(nullptr);
+    if (!fixedFileInfo) {
+        return false;
+    }
+
+    WORD major = HIWORD(fixedFileInfo->dwFileVersionMS);
+    WORD build = HIWORD(fixedFileInfo->dwFileVersionLS);
+
+    Wh_Log(L"Explorer version: %u.%u.%u.%u", major,
+           LOWORD(fixedFileInfo->dwFileVersionMS), build,
+           LOWORD(fixedFileInfo->dwFileVersionLS));
+
+    return major == 10 && build >= 22000;
+}
+
+BOOL Wh_ModInit() {
+    Wh_Log(L">");
+
+    LoadSettings();
+
+    if (!IsWindows11()) {
+        Wh_Log(L"Unsupported Windows version");
+        return FALSE;
+    }
+
+    if (!HookTaskbarDllSymbols()) {
+        return FALSE;
+    }
+
+    if (!Wh_SetFunctionHook((void*)CreateWindowExW,
+                            (void*)CreateWindowExW_Hook,
+                            (void**)&CreateWindowExW_Original)) {
+        Wh_Log(L"Failed to hook CreateWindowExW");
+        return FALSE;
+    }
+
+    HMODULE user32Module =
+        LoadLibraryEx(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (user32Module) {
+        if (void* createWindowInBand =
+                (void*)GetProcAddress(user32Module, "CreateWindowInBand")) {
+            Wh_SetFunctionHook(createWindowInBand,
+                               (void*)CreateWindowInBand_Hook,
+                               (void**)&CreateWindowInBand_Original);
+        }
+
+        if (void* createWindowInBandEx =
+                (void*)GetProcAddress(user32Module, "CreateWindowInBandEx")) {
+            Wh_SetFunctionHook(createWindowInBandEx,
+                               (void*)CreateWindowInBandEx_Hook,
+                               (void**)&CreateWindowInBandEx_Original);
+        }
+    }
+
+    g_initialized = true;
+    return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    Wh_Log(L">");
+
+    FindAndHookExistingInputSites();
+    ApplyClockTooltipSettings();
+    StartStartupRetryTimer();
+}
+
+void Wh_ModUninit() {
+    Wh_Log(L">");
+
+    StopStartupRetryTimer();
+}
+
+void Wh_ModSettingsChanged() {
+    Wh_Log(L">");
+
+    LoadSettings();
+    ApplyClockTooltipSettings();
+}

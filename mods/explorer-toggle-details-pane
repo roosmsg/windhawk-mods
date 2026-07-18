@@ -1,0 +1,761 @@
+// ==WindhawkMod==
+// @id              explorer-toggle-details-pane
+// @name            Explorer Toggle Details Pane
+// @description     Toggle Explorer panes when clicking empty space
+// @version         0.1
+// @author          Djinx
+// @include         explorer.exe
+// @compilerOptions -lcomctl32 -loleaut32 -lole32
+// @architecture    x86-64
+// @license         GPL-3.0
+// ==/WindhawkMod==
+
+// Source code is published under The GNU General Public License v3.0.
+//
+// Empty-space click handling is based on "Explorer Double Click Up",
+// which is licensed under GPL-3.0.
+
+// ==WindhawkModReadme==
+/*
+# Explorer Toggle Details Pane
+
+Toggle File Explorer panes by clicking empty space in the file list. In the
+mod settings, pick per pane which mouse button toggles it: the left button
+(double-click) or the middle/scroll wheel button (single click); each action
+can also be disabled.
+
+The details pane is toggled by sending `Alt+Shift+P`. For the navigation pane,
+the mod toggles Explorer's per-tab `PageSpaceControlSizer_Visible` state.
+
+## Windows version support
+
+This mod targets 64-bit Windows 10 and Windows 11 File Explorer.
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- detailsPaneButton: left
+  $name: Details pane mouse button
+  $description: >-
+    The button that toggles the details pane (sends Alt+Shift+P) when clicked
+    on empty space
+  $options:
+  - left: Left button (double-click)
+  - middle: Middle button (single scroll wheel click)
+  - none: Disabled
+- navigationPaneButton: middle
+  $name: Navigation pane mouse button
+  $description: >-
+    The button that toggles the navigation pane when clicked on empty space
+  $options:
+  - left: Left button (double-click)
+  - middle: Middle button (single scroll wheel click)
+  - none: Disabled
+*/
+// ==/WindhawkModSettings==
+
+#include <initguid.h>
+#include <windhawk_utils.h>
+#include <windows.h>
+#include <windowsx.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+
+#include <commctrl.h>
+#include <UIAutomationClient.h>
+#include <UIAutomationCore.h>
+#include <comutil.h>
+#include <winrt/base.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <vector>
+
+using bstr_ptr = _bstr_t;
+
+static const GUID kSidFrameManager = {
+    0x31e4fa78,
+    0x02b4,
+    0x419f,
+    {0x94, 0x30, 0x7b, 0x75, 0x85, 0x23, 0x7c, 0x77}
+};
+
+static const GUID kSidPerBrowserPropertyBag = {
+    0xa3b24a0a,
+    0x7b68,
+    0x448d,
+    {0x99, 0x79, 0xc7, 0x00, 0x05, 0x9c, 0x3a, 0xd1}
+};
+
+class COMInitializer {
+public:
+    COMInitializer() : initialized(false) {}
+
+    bool Init() {
+        if (!initialized) {
+            initialized = SUCCEEDED(
+                CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+        }
+
+        return initialized;
+    }
+
+    void Uninit() {
+        if (initialized) {
+            CoUninitialize();
+            initialized = false;
+            Wh_Log(L"COM de-initialized");
+        }
+    }
+
+    ~COMInitializer() {
+        Uninit();
+    }
+
+private:
+    bool initialized;
+} g_comInitializer;
+
+std::vector<HWND> g_SubclassedSysListViews;
+std::vector<HWND> g_SubclassedDefViews;
+static winrt::com_ptr<IUIAutomation> g_pUIAutomation;
+
+enum class TriggerButton {
+    None,
+    Left,
+    Middle,
+};
+
+struct {
+    TriggerButton detailsPaneButton;
+    TriggerButton navigationPaneButton;
+} g_settings;
+
+TriggerButton TriggerButtonFromSetting(PCWSTR settingName) {
+    PCWSTR value = Wh_GetStringSetting(settingName);
+
+    TriggerButton button = TriggerButton::None;
+    if (value && wcscmp(value, L"left") == 0) {
+        button = TriggerButton::Left;
+    } else if (value && wcscmp(value, L"middle") == 0) {
+        button = TriggerButton::Middle;
+    }
+
+    Wh_FreeStringSetting(value);
+    return button;
+}
+
+void LoadSettings() {
+    g_settings.detailsPaneButton =
+        TriggerButtonFromSetting(L"detailsPaneButton");
+    g_settings.navigationPaneButton =
+        TriggerButtonFromSetting(L"navigationPaneButton");
+}
+
+bool ButtonHasAction(TriggerButton button) {
+    return button != TriggerButton::None &&
+           (g_settings.detailsPaneButton == button ||
+            g_settings.navigationPaneButton == button);
+}
+
+// WM_PARENTNOTIFY only reports button-down events, never double-click
+// messages, so DirectUI empty-space left double-clicks are detected from two
+// consecutive notifications within the system double-click time and rectangle.
+struct EmptySpaceClick {
+    HWND hWnd = nullptr;
+    DWORD time = 0;
+    POINT pt = {};
+};
+
+EmptySpaceClick g_lastDefViewEmptyClick;
+
+bool IsSecondClickOfDoubleClick(const EmptySpaceClick& lastClick,
+                                HWND hWnd,
+                                DWORD time,
+                                POINT pt) {
+    return lastClick.hWnd == hWnd &&
+           time - lastClick.time <= GetDoubleClickTime() &&
+           abs(pt.x - lastClick.pt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
+           abs(pt.y - lastClick.pt.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
+}
+
+void RememberSubclassedWindow(std::vector<HWND>& windows, HWND hWnd) {
+    if (std::find(windows.begin(), windows.end(), hWnd) == windows.end()) {
+        windows.push_back(hWnd);
+    }
+}
+
+bool IsWindowClass(HWND hWnd, PCWSTR expectedClassName) {
+    if (!hWnd) {
+        return false;
+    }
+
+    wchar_t className[256] = {};
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+    return wcscmp(className, expectedClassName) == 0;
+}
+
+HWND FindShellTabWindowFromChild(HWND hWnd) {
+    for (HWND parent = hWnd; parent; parent = GetParent(parent)) {
+        if (IsWindowClass(parent, L"ShellTabWindowClass")) {
+            return parent;
+        }
+    }
+
+    return nullptr;
+}
+
+bool HasShellTabWindowParent(HWND hWnd) {
+    return FindShellTabWindowFromChild(hWnd) != nullptr;
+}
+
+bool IsDirectUIEmptySpaceClass(PCWSTR className) {
+    return wcscmp(className, L"UIGroupItem") == 0 ||
+           wcscmp(className, L"UIItemsView") == 0;
+}
+
+void CopyClassName(wchar_t (&dest)[256], PCWSTR src) {
+    if (!src) {
+        dest[0] = L'\0';
+        return;
+    }
+
+    wcsncpy(dest, src, ARRAYSIZE(dest) - 1);
+    dest[ARRAYSIZE(dest) - 1] = L'\0';
+}
+
+bool GetShellBrowserFromChildWindow(HWND hWnd,
+                                    winrt::com_ptr<IShellBrowser>& shellBrowser) {
+    HWND shellTab = FindShellTabWindowFromChild(hWnd);
+    if (!shellTab) {
+        return false;
+    }
+
+    // WM_GETISHELLBROWSER returns the browser without adding a reference,
+    // so copy it with an AddRef; taking ownership would over-release it and
+    // eventually crash Explorer.
+    IShellBrowser* rawShellBrowser = reinterpret_cast<IShellBrowser*>(
+        SendMessageW(shellTab, WM_USER + 7, 0, 0));
+    if (!rawShellBrowser) {
+        Wh_Log(L"Failed to get IShellBrowser for ShellTabWindowClass %p",
+               shellTab);
+        return false;
+    }
+
+    shellBrowser.copy_from(rawShellBrowser);
+    return true;
+}
+
+bool GetPerBrowserPropertyBag(IShellBrowser* shellBrowser,
+                              winrt::com_ptr<IPropertyBag>& propertyBag) {
+    if (!shellBrowser) {
+        return false;
+    }
+
+    winrt::com_ptr<IServiceProvider> browserServiceProvider;
+    HRESULT hr = shellBrowser->QueryInterface(
+        IID_PPV_ARGS(browserServiceProvider.put()));
+    if (FAILED(hr) || !browserServiceProvider) {
+        Wh_Log(L"Failed to query browser service provider: 0x%08X", hr);
+        return false;
+    }
+
+    winrt::com_ptr<IUnknown> frameManager;
+    hr = browserServiceProvider->QueryService(
+        kSidFrameManager, IID_PPV_ARGS(frameManager.put()));
+    if (FAILED(hr) || !frameManager) {
+        Wh_Log(L"Failed to query frame manager: 0x%08X", hr);
+        return false;
+    }
+
+    winrt::com_ptr<IServiceProvider> frameServiceProvider;
+    hr = frameManager->QueryInterface(IID_PPV_ARGS(frameServiceProvider.put()));
+    if (FAILED(hr) || !frameServiceProvider) {
+        Wh_Log(L"Failed to query frame service provider: 0x%08X", hr);
+        return false;
+    }
+
+    hr = frameServiceProvider->QueryService(
+        kSidPerBrowserPropertyBag, IID_PPV_ARGS(propertyBag.put()));
+    if (FAILED(hr) || !propertyBag) {
+        Wh_Log(L"Failed to query per-browser property bag: 0x%08X", hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool ReadPerBrowserBoolProperty(HWND hWnd, PCWSTR propertyName, bool* valueOut) {
+    if (!valueOut) {
+        return false;
+    }
+
+    *valueOut = false;
+
+    winrt::com_ptr<IShellBrowser> shellBrowser;
+    if (!GetShellBrowserFromChildWindow(hWnd, shellBrowser)) {
+        return false;
+    }
+
+    winrt::com_ptr<IPropertyBag> propertyBag;
+    if (!GetPerBrowserPropertyBag(shellBrowser.get(), propertyBag)) {
+        return false;
+    }
+
+    VARIANT value;
+    VariantInit(&value);
+    HRESULT hr = propertyBag->Read(propertyName, &value, nullptr);
+    if (FAILED(hr)) {
+        Wh_Log(L"Failed to read %s: 0x%08X", propertyName, hr);
+        return false;
+    }
+
+    bool read = true;
+    switch (value.vt) {
+        case VT_BOOL:
+            *valueOut = value.boolVal != VARIANT_FALSE;
+            break;
+
+        case VT_I4:
+            *valueOut = value.lVal != 0;
+            break;
+
+        case VT_UI4:
+            *valueOut = value.ulVal != 0;
+            break;
+
+        case VT_EMPTY:
+        case VT_NULL:
+            *valueOut = false;
+            break;
+
+        default:
+            Wh_Log(L"Unexpected variant type for %s: %u", propertyName,
+                   value.vt);
+            read = false;
+            break;
+    }
+
+    VariantClear(&value);
+    return read;
+}
+
+bool WritePerBrowserBoolProperty(HWND hWnd, PCWSTR propertyName, bool value) {
+    winrt::com_ptr<IShellBrowser> shellBrowser;
+    if (!GetShellBrowserFromChildWindow(hWnd, shellBrowser)) {
+        return false;
+    }
+
+    winrt::com_ptr<IPropertyBag> propertyBag;
+    if (!GetPerBrowserPropertyBag(shellBrowser.get(), propertyBag)) {
+        return false;
+    }
+
+    VARIANT variantValue;
+    VariantInit(&variantValue);
+    variantValue.vt = VT_BOOL;
+    variantValue.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
+
+    HRESULT hr = propertyBag->Write(propertyName, &variantValue);
+    VariantClear(&variantValue);
+    if (FAILED(hr)) {
+        Wh_Log(L"Failed to write %s: 0x%08X", propertyName, hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool GetNavigationTreeViewFromShellBrowser(IShellBrowser* shellBrowser,
+                                           HWND* treeViewOut) {
+    if (!treeViewOut) {
+        return false;
+    }
+
+    *treeViewOut = nullptr;
+
+    if (!shellBrowser) {
+        return false;
+    }
+
+    winrt::com_ptr<IServiceProvider> serviceProvider;
+    HRESULT hr = shellBrowser->QueryInterface(
+        IID_PPV_ARGS(serviceProvider.put()));
+    if (FAILED(hr) || !serviceProvider) {
+        return false;
+    }
+
+    winrt::com_ptr<INameSpaceTreeControl> namespaceTree;
+    hr = serviceProvider->QueryService(
+        IID_INameSpaceTreeControl, IID_PPV_ARGS(namespaceTree.put()));
+    if (FAILED(hr) || !namespaceTree) {
+        return false;
+    }
+
+    winrt::com_ptr<IOleWindow> oleWindow;
+    hr = namespaceTree->QueryInterface(IID_PPV_ARGS(oleWindow.put()));
+    if (FAILED(hr) || !oleWindow) {
+        return false;
+    }
+
+    HWND namespaceTreeWindow = nullptr;
+    if (FAILED(oleWindow->GetWindow(&namespaceTreeWindow)) ||
+        !namespaceTreeWindow) {
+        return false;
+    }
+
+    *treeViewOut = FindWindowExW(namespaceTreeWindow, nullptr,
+                                 L"SysTreeView32", nullptr);
+    return *treeViewOut != nullptr;
+}
+
+struct NavigationPaneVisibilityContext {
+    bool foundVisibleTreeView = false;
+};
+
+BOOL CALLBACK FindVisibleNavigationTreeViewProc(HWND hWnd, LPARAM lParam) {
+    auto* context = reinterpret_cast<NavigationPaneVisibilityContext*>(lParam);
+    if (IsWindowClass(hWnd, L"SysTreeView32") && IsWindowVisible(hWnd)) {
+        context->foundVisibleTreeView = true;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+bool IsNavigationPaneVisibleByTreeView(HWND hWnd, bool* visible) {
+    if (!visible) {
+        return false;
+    }
+
+    winrt::com_ptr<IShellBrowser> shellBrowser;
+    if (GetShellBrowserFromChildWindow(hWnd, shellBrowser)) {
+        HWND treeView = nullptr;
+        if (GetNavigationTreeViewFromShellBrowser(shellBrowser.get(),
+                                                  &treeView)) {
+            *visible = IsWindowVisible(treeView);
+            return true;
+        }
+    }
+
+    HWND shellTab = FindShellTabWindowFromChild(hWnd);
+    if (!shellTab) {
+        return false;
+    }
+
+    NavigationPaneVisibilityContext context;
+    EnumChildWindows(shellTab, FindVisibleNavigationTreeViewProc,
+                     reinterpret_cast<LPARAM>(&context));
+
+    *visible = context.foundVisibleTreeView;
+    return true;
+}
+
+void SendAltShiftP(HWND hWnd) {
+    HWND topLevel = GetAncestor(hWnd, GA_ROOT);
+    if (topLevel) {
+        SetForegroundWindow(topLevel);
+    }
+
+    INPUT inputs[6] = {};
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_MENU;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_SHIFT;
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'P';
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = 'P';
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[4].type = INPUT_KEYBOARD;
+    inputs[4].ki.wVk = VK_SHIFT;
+    inputs[4].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[5].type = INPUT_KEYBOARD;
+    inputs[5].ki.wVk = VK_MENU;
+    inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    UINT sent = SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+    if (sent != ARRAYSIZE(inputs)) {
+        Wh_Log(L"Failed to send Alt+Shift+P, sent %u of %u inputs",
+               sent, ARRAYSIZE(inputs));
+    }
+}
+
+void SendToggleNavigationPane(HWND hWnd) {
+    bool visible = false;
+    if (!ReadPerBrowserBoolProperty(
+            hWnd, L"PageSpaceControlSizer_Visible", &visible) &&
+        !IsNavigationPaneVisibleByTreeView(hWnd, &visible)) {
+        Wh_Log(L"Failed to determine navigation pane visibility");
+        return;
+    }
+
+    if (!WritePerBrowserBoolProperty(
+            hWnd, L"PageSpaceControlSizer_Visible", !visible)) {
+        Wh_Log(L"Failed to toggle navigation pane");
+    }
+}
+
+void OnEmptySpaceTrigger(HWND hWnd, TriggerButton button) {
+    if (g_settings.detailsPaneButton == button) {
+        SendAltShiftP(hWnd);
+    }
+    if (g_settings.navigationPaneButton == button) {
+        SendToggleNavigationPane(hWnd);
+    }
+}
+
+bool IsSysListViewEmptySpace(HWND hWnd, LPARAM lParam) {
+    LVHITTESTINFO hitTestInfo = {};
+    hitTestInfo.pt.x = GET_X_LPARAM(lParam);
+    hitTestInfo.pt.y = GET_Y_LPARAM(lParam);
+
+    return ListView_SubItemHitTest(hWnd, &hitTestInfo) == -1;
+}
+
+LRESULT CALLBACK SysListViewSubclass(HWND hWnd,
+                                     UINT uMsg,
+                                     WPARAM wParam,
+                                     LPARAM lParam,
+                                     DWORD_PTR dwRefData) {
+    switch (uMsg) {
+        // The left button triggers on double-click; a single left-click is
+        // Explorer's normal select/deselect. The middle button has no native
+        // action on empty space, so it triggers on a single click.
+        case WM_LBUTTONDBLCLK:
+            if (ButtonHasAction(TriggerButton::Left) &&
+                IsSysListViewEmptySpace(hWnd, lParam)) {
+                OnEmptySpaceTrigger(hWnd, TriggerButton::Left);
+            }
+            break;
+
+        case WM_MBUTTONDOWN:
+            if (ButtonHasAction(TriggerButton::Middle) &&
+                IsSysListViewEmptySpace(hWnd, lParam)) {
+                OnEmptySpaceTrigger(hWnd, TriggerButton::Middle);
+            }
+            break;
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+bool IsDirectUIEmptySpaceAtCursor() {
+    if (!g_pUIAutomation) {
+        return false;
+    }
+
+    POINT screenPoint = {};
+    GetCursorPos(&screenPoint);
+
+    winrt::com_ptr<IUIAutomationElement> element;
+    if (FAILED(g_pUIAutomation->ElementFromPoint(screenPoint, element.put())) ||
+        !element) {
+        return false;
+    }
+
+    bstr_ptr bstrClassName;
+    if (FAILED(element->get_CurrentClassName(bstrClassName.GetAddress()))) {
+        return false;
+    }
+
+    wchar_t className[256] = {};
+    CopyClassName(className, bstrClassName.GetBSTR());
+    return IsDirectUIEmptySpaceClass(className);
+}
+
+LRESULT CALLBACK DefViewSubclass(HWND hWnd,
+                                 UINT uMsg,
+                                 WPARAM wParam,
+                                 LPARAM lParam,
+                                 DWORD_PTR dwRefData) {
+    if (uMsg == WM_PARENTNOTIFY && LOWORD(wParam) == WM_LBUTTONDOWN &&
+        ButtonHasAction(TriggerButton::Left) &&
+        IsDirectUIEmptySpaceAtCursor()) {
+        DWORD time = (DWORD)GetMessageTime();
+        POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+
+        if (IsSecondClickOfDoubleClick(g_lastDefViewEmptyClick, hWnd, time,
+                                       pt)) {
+            g_lastDefViewEmptyClick = {};
+            OnEmptySpaceTrigger(hWnd, TriggerButton::Left);
+        } else {
+            g_lastDefViewEmptyClick = {hWnd, time, pt};
+        }
+    } else if (uMsg == WM_PARENTNOTIFY && LOWORD(wParam) == WM_MBUTTONDOWN &&
+               ButtonHasAction(TriggerButton::Middle) &&
+               IsDirectUIEmptySpaceAtCursor()) {
+        OnEmptySpaceTrigger(hWnd, TriggerButton::Middle);
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+void SubclassSysListView(HWND hWnd) {
+    if (std::find(g_SubclassedSysListViews.begin(),
+                  g_SubclassedSysListViews.end(),
+                  hWnd) != g_SubclassedSysListViews.end()) {
+        return;
+    }
+
+    if (WindhawkUtils::SetWindowSubclassFromAnyThread(
+            hWnd, SysListViewSubclass, 0)) {
+        RememberSubclassedWindow(g_SubclassedSysListViews, hWnd);
+        Wh_Log(L"SysListView32 subclassed %p", hWnd);
+    }
+}
+
+void SubclassDefView(HWND hWnd) {
+    if (std::find(g_SubclassedDefViews.begin(), g_SubclassedDefViews.end(),
+                  hWnd) != g_SubclassedDefViews.end()) {
+        return;
+    }
+
+    if (WindhawkUtils::SetWindowSubclassFromAnyThread(hWnd, DefViewSubclass,
+                                                      0)) {
+        RememberSubclassedWindow(g_SubclassedDefViews, hWnd);
+        Wh_Log(L"SHELLDLL_DefView subclassed %p", hWnd);
+    }
+}
+
+void TrySubclassExplorerView(HWND hWnd) {
+    HWND parent = GetParent(hWnd);
+    if (!parent || !IsWindowClass(parent, L"SHELLDLL_DefView") ||
+        !HasShellTabWindowParent(parent)) {
+        return;
+    }
+
+    if (IsWindowClass(hWnd, L"SysListView32")) {
+        SubclassSysListView(hWnd);
+        SubclassDefView(parent);
+    } else if (IsWindowClass(hWnd, L"DirectUIHWND")) {
+        SubclassDefView(parent);
+    }
+}
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+
+HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
+                                 LPCWSTR lpClassName,
+                                 LPCWSTR lpWindowName,
+                                 DWORD dwStyle,
+                                 int X,
+                                 int Y,
+                                 int nWidth,
+                                 int nHeight,
+                                 HWND hWndParent,
+                                 HMENU hMenu,
+                                 HINSTANCE hInstance,
+                                 LPVOID lpParam) {
+    HWND hWnd = CreateWindowExW_Original(
+        dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
+        hWndParent, hMenu, hInstance, lpParam);
+
+    if (hWnd) {
+        TrySubclassExplorerView(hWnd);
+    }
+
+    return hWnd;
+}
+
+BOOL CALLBACK InitEnumChildWindowsProc(HWND hWnd, LPARAM lParam) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return TRUE;
+    }
+
+    if (IsWindowClass(hWnd, L"SHELLDLL_DefView") &&
+        HasShellTabWindowParent(hWnd)) {
+        HWND listView = FindWindowExW(hWnd, nullptr, L"SysListView32",
+                                      nullptr);
+        HWND directUI = FindWindowExW(hWnd, nullptr, L"DirectUIHWND",
+                                      nullptr);
+
+        if (listView) {
+            SubclassSysListView(listView);
+            SubclassDefView(hWnd);
+        } else if (directUI) {
+            SubclassDefView(hWnd);
+        }
+    }
+
+    return TRUE;
+}
+
+BOOL CALLBACK InitEnumWindowsProc(HWND hWnd, LPARAM lParam) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowClass(hWnd, L"CabinetWClass")) {
+        EnumChildWindows(hWnd, InitEnumChildWindowsProc, 0);
+    }
+
+    return TRUE;
+}
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Explorer Toggle Details Pane Init");
+
+    LoadSettings();
+
+    WindhawkUtils::SetFunctionHook((void*)CreateWindowExW,
+                                   (void*)CreateWindowExW_Hook,
+                                   (void**)&CreateWindowExW_Original);
+
+    if (!g_comInitializer.Init()) {
+        Wh_Log(L"COM initialization failed");
+        return FALSE;
+    }
+
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation),
+                                  g_pUIAutomation.put_void());
+    if (FAILED(hr) || !g_pUIAutomation) {
+        Wh_Log(L"Failed to create UIAutomation COM instance: 0x%08X", hr);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    EnumWindows(InitEnumWindowsProc, 0);
+}
+
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+}
+
+void Wh_ModUninit() {
+    for (HWND hWnd : g_SubclassedSysListViews) {
+        if (IsWindow(hWnd)) {
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(
+                hWnd, SysListViewSubclass);
+            Wh_Log(L"SysListView32 unsubclassed %p", hWnd);
+        }
+    }
+
+    for (HWND hWnd : g_SubclassedDefViews) {
+        if (IsWindow(hWnd)) {
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hWnd,
+                                                             DefViewSubclass);
+            Wh_Log(L"SHELLDLL_DefView unsubclassed %p", hWnd);
+        }
+    }
+
+    g_SubclassedSysListViews.clear();
+    g_SubclassedDefViews.clear();
+    g_pUIAutomation = nullptr;
+    g_comInitializer.Uninit();
+
+    Wh_Log(L"Explorer Toggle Details Pane Uninit");
+}
