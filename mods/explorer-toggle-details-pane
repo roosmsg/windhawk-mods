@@ -2,7 +2,7 @@
 // @id              explorer-toggle-details-pane
 // @name            Explorer Toggle Details Pane
 // @description     Toggle Explorer panes when clicking empty space
-// @version         0.1
+// @version         0.2
 // @author          Djinx
 // @include         explorer.exe
 // @compilerOptions -lcomctl32 -loleaut32 -lole32
@@ -26,6 +26,8 @@ can also be disabled.
 
 The details pane is toggled by sending `Alt+Shift+P`. For the navigation pane,
 the mod toggles Explorer's per-tab `PageSpaceControlSizer_Visible` state.
+When the navigation pane is hidden, the file list gets a DPI-scaled 30-pixel
+left inset so its contents don't sit directly against the window edge.
 
 ## Windows version support
 
@@ -118,8 +120,21 @@ private:
 } g_comInitializer;
 
 std::vector<HWND> g_SubclassedSysListViews;
+std::vector<HWND> g_SubclassedDirectUIViews;
 std::vector<HWND> g_SubclassedDefViews;
 static winrt::com_ptr<IUIAutomation> g_pUIAutomation;
+UINT g_updateFileListInsetMessage;
+bool g_unloading;
+
+constexpr int kHiddenNavigationPaneFileListInsetDip = 30;
+constexpr wchar_t kFileListInsetProperty[] =
+    L"Windhawk.explorer-toggle-details-pane.FileListInset";
+
+enum class NavigationPaneVisibilityHint : WPARAM {
+    Query,
+    Visible,
+    Hidden,
+};
 
 enum class TriggerButton {
     None,
@@ -184,6 +199,11 @@ void RememberSubclassedWindow(std::vector<HWND>& windows, HWND hWnd) {
     if (std::find(windows.begin(), windows.end(), hWnd) == windows.end()) {
         windows.push_back(hWnd);
     }
+}
+
+void ForgetSubclassedWindow(std::vector<HWND>& windows, HWND hWnd) {
+    windows.erase(std::remove(windows.begin(), windows.end(), hWnd),
+                  windows.end());
 }
 
 bool IsWindowClass(HWND hWnd, PCWSTR expectedClassName) {
@@ -452,6 +472,170 @@ bool IsNavigationPaneVisibleByTreeView(HWND hWnd, bool* visible) {
     return true;
 }
 
+HWND FindDefViewFromChild(HWND hWnd) {
+    for (HWND current = hWnd; current; current = GetParent(current)) {
+        if (IsWindowClass(current, L"SHELLDLL_DefView")) {
+            return current;
+        }
+    }
+
+    return nullptr;
+}
+
+bool GetStoredFileListInset(HWND defView, int* inset) {
+    HANDLE value = GetPropW(defView, kFileListInsetProperty);
+    if (!value) {
+        return false;
+    }
+
+    *inset = static_cast<int>(reinterpret_cast<INT_PTR>(value) - 1);
+    return true;
+}
+
+void SetSingleFileListLeftInset(HWND defView, HWND fileList, int inset) {
+    if (!fileList) {
+        return;
+    }
+
+    RECT fileListRect;
+    RECT defViewRect;
+    if (!GetWindowRect(fileList, &fileListRect) ||
+        !GetClientRect(defView, &defViewRect)) {
+        return;
+    }
+    MapWindowPoints(nullptr, defView,
+                    reinterpret_cast<POINT*>(&fileListRect), 2);
+
+    // Keep Explorer's current top and bottom, and anchor the view to the
+    // DefView's right edge. Only the left edge is inset, which works for both
+    // DirectUIHWND and classic SysListView32 folder views without affecting
+    // the navigation pane itself.
+    int right = std::max(defViewRect.right, 0L);
+    int left = std::clamp(inset, 0, right);
+    int width = right - left;
+    int height = std::max(fileListRect.bottom - fileListRect.top, 0L);
+
+    if (fileListRect.left == left &&
+        fileListRect.right - fileListRect.left == width) {
+        return;
+    }
+
+    SetWindowPos(fileList, nullptr, left, fileListRect.top, width, height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void SetFileListLeftInset(HWND defView, int inset) {
+    inset = std::max(inset, 0);
+    if (!SetPropW(defView, kFileListInsetProperty,
+                  reinterpret_cast<HANDLE>(
+                      static_cast<INT_PTR>(inset + 1)))) {
+        Wh_Log(L"Failed to store file-list inset for %p", defView);
+    }
+
+    // Explorer can temporarily retain both view implementations while
+    // changing folders or view modes, so update every matching direct child.
+    constexpr PCWSTR fileListClasses[] = {L"DirectUIHWND",
+                                           L"SysListView32"};
+    for (PCWSTR className : fileListClasses) {
+        HWND fileList = nullptr;
+        while ((fileList =
+                    FindWindowExW(defView, fileList, className, nullptr))) {
+            SetSingleFileListLeftInset(defView, fileList, inset);
+        }
+    }
+}
+
+void ReapplyStoredFileListInset(HWND defView) {
+    int inset = 0;
+    if (GetStoredFileListInset(defView, &inset)) {
+        SetFileListLeftInset(defView, inset);
+    }
+}
+
+void AdjustFileListWindowPos(HWND fileList, WINDOWPOS* windowPos) {
+    if (!windowPos ||
+        ((windowPos->flags & SWP_NOMOVE) &&
+         (windowPos->flags & SWP_NOSIZE))) {
+        return;
+    }
+
+    HWND defView = GetParent(fileList);
+    int inset = 0;
+    if (!defView || !GetStoredFileListInset(defView, &inset)) {
+        return;
+    }
+
+    RECT defViewRect;
+    RECT fileListRect;
+    if (!GetClientRect(defView, &defViewRect) ||
+        !GetWindowRect(fileList, &fileListRect)) {
+        return;
+    }
+    MapWindowPoints(nullptr, defView,
+                    reinterpret_cast<POINT*>(&fileListRect), 2);
+
+    int right = std::max(defViewRect.right, 0L);
+    int left = std::clamp(inset, 0, right);
+
+    if (windowPos->flags & SWP_NOMOVE) {
+        windowPos->y = fileListRect.top;
+    }
+    if (windowPos->flags & SWP_NOSIZE) {
+        windowPos->cy =
+            std::max(fileListRect.bottom - fileListRect.top, 0L);
+    }
+
+    windowPos->x = left;
+    windowPos->cx = right - left;
+    windowPos->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+}
+
+void UpdateFileListInset(
+    HWND defView,
+    NavigationPaneVisibilityHint visibilityHint =
+        NavigationPaneVisibilityHint::Query) {
+    bool navigationPaneVisible = false;
+
+    if (g_unloading) {
+        navigationPaneVisible = true;
+    } else if (visibilityHint == NavigationPaneVisibilityHint::Visible) {
+        navigationPaneVisible = true;
+    } else if (visibilityHint == NavigationPaneVisibilityHint::Hidden) {
+        navigationPaneVisible = false;
+    } else if (!ReadPerBrowserBoolProperty(
+                   defView, L"PageSpaceControlSizer_Visible",
+                   &navigationPaneVisible) &&
+               !IsNavigationPaneVisibleByTreeView(
+                   defView, &navigationPaneVisible)) {
+        Wh_Log(L"Failed to determine navigation pane visibility for %p",
+               defView);
+        return;
+    }
+
+    int inset = 0;
+    if (!navigationPaneVisible) {
+        UINT dpi = GetDpiForWindow(defView);
+        if (!dpi) {
+            dpi = USER_DEFAULT_SCREEN_DPI;
+        }
+        inset = MulDiv(kHiddenNavigationPaneFileListInsetDip, dpi,
+                       USER_DEFAULT_SCREEN_DPI);
+    }
+
+    SetFileListLeftInset(defView, inset);
+}
+
+void PostFileListInsetUpdate(
+    HWND hWnd,
+    NavigationPaneVisibilityHint visibilityHint =
+        NavigationPaneVisibilityHint::Query) {
+    HWND defView = FindDefViewFromChild(hWnd);
+    if (defView && g_updateFileListInsetMessage) {
+        PostMessageW(defView, g_updateFileListInsetMessage,
+                     static_cast<WPARAM>(visibilityHint), 0);
+    }
+}
+
 void SendAltShiftP(HWND hWnd) {
     HWND topLevel = GetAncestor(hWnd, GA_ROOT);
     if (topLevel) {
@@ -497,10 +681,18 @@ void SendToggleNavigationPane(HWND hWnd) {
         return;
     }
 
+    bool newVisible = !visible;
     if (!WritePerBrowserBoolProperty(
-            hWnd, L"PageSpaceControlSizer_Visible", !visible)) {
+            hWnd, L"PageSpaceControlSizer_Visible", newVisible)) {
         Wh_Log(L"Failed to toggle navigation pane");
+        return;
     }
+
+    // Explorer applies the pane layout asynchronously. Queue the file-list
+    // update with the state we just wrote instead of querying stale UI state.
+    PostFileListInsetUpdate(
+        hWnd, newVisible ? NavigationPaneVisibilityHint::Visible
+                         : NavigationPaneVisibilityHint::Hidden);
 }
 
 void OnEmptySpaceTrigger(HWND hWnd, TriggerButton button) {
@@ -525,6 +717,11 @@ LRESULT CALLBACK SysListViewSubclass(HWND hWnd,
                                      WPARAM wParam,
                                      LPARAM lParam,
                                      DWORD_PTR dwRefData) {
+    if (uMsg == WM_WINDOWPOSCHANGING) {
+        AdjustFileListWindowPos(hWnd,
+                                reinterpret_cast<WINDOWPOS*>(lParam));
+    }
+
     switch (uMsg) {
         // The left button triggers on double-click; a single left-click is
         // Explorer's normal select/deselect. The middle button has no native
@@ -544,7 +741,30 @@ LRESULT CALLBACK SysListViewSubclass(HWND hWnd,
             break;
     }
 
-    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    if (uMsg == WM_NCDESTROY) {
+        ForgetSubclassedWindow(g_SubclassedSysListViews, hWnd);
+    }
+
+    return result;
+}
+
+LRESULT CALLBACK DirectUIWindowSubclass(HWND hWnd,
+                                        UINT uMsg,
+                                        WPARAM wParam,
+                                        LPARAM lParam,
+                                        DWORD_PTR dwRefData) {
+    if (uMsg == WM_WINDOWPOSCHANGING) {
+        AdjustFileListWindowPos(hWnd,
+                                reinterpret_cast<WINDOWPOS*>(lParam));
+    }
+
+    LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    if (uMsg == WM_NCDESTROY) {
+        ForgetSubclassedWindow(g_SubclassedDirectUIViews, hWnd);
+    }
+
+    return result;
 }
 
 bool IsDirectUIEmptySpaceAtCursor() {
@@ -576,6 +796,12 @@ LRESULT CALLBACK DefViewSubclass(HWND hWnd,
                                  WPARAM wParam,
                                  LPARAM lParam,
                                  DWORD_PTR dwRefData) {
+    if (uMsg == g_updateFileListInsetMessage) {
+        UpdateFileListInset(
+            hWnd, static_cast<NavigationPaneVisibilityHint>(wParam));
+        return 0;
+    }
+
     if (uMsg == WM_PARENTNOTIFY && LOWORD(wParam) == WM_LBUTTONDOWN &&
         ButtonHasAction(TriggerButton::Left) &&
         IsDirectUIEmptySpaceAtCursor()) {
@@ -595,7 +821,26 @@ LRESULT CALLBACK DefViewSubclass(HWND hWnd,
         OnEmptySpaceTrigger(hWnd, TriggerButton::Middle);
     }
 
-    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+    // Explorer can reset its child geometry while resizing for the details
+    // pane. Restore the already-known inset synchronously, before this layout
+    // message returns and Windows gets a chance to paint an unpadded frame.
+    // The queued visibility check is still needed for pane changes made
+    // outside this mod.
+    if (!g_unloading &&
+        (uMsg == WM_SIZE || uMsg == WM_WINDOWPOSCHANGED ||
+         (uMsg == WM_SHOWWINDOW && wParam))) {
+        ReapplyStoredFileListInset(hWnd);
+        PostFileListInsetUpdate(hWnd);
+    }
+
+    if (uMsg == WM_NCDESTROY) {
+        RemovePropW(hWnd, kFileListInsetProperty);
+        ForgetSubclassedWindow(g_SubclassedDefViews, hWnd);
+    }
+
+    return result;
 }
 
 void SubclassSysListView(HWND hWnd) {
@@ -612,6 +857,20 @@ void SubclassSysListView(HWND hWnd) {
     }
 }
 
+void SubclassDirectUIView(HWND hWnd) {
+    if (std::find(g_SubclassedDirectUIViews.begin(),
+                  g_SubclassedDirectUIViews.end(),
+                  hWnd) != g_SubclassedDirectUIViews.end()) {
+        return;
+    }
+
+    if (WindhawkUtils::SetWindowSubclassFromAnyThread(
+            hWnd, DirectUIWindowSubclass, 0)) {
+        RememberSubclassedWindow(g_SubclassedDirectUIViews, hWnd);
+        Wh_Log(L"DirectUIHWND subclassed %p", hWnd);
+    }
+}
+
 void SubclassDefView(HWND hWnd) {
     if (std::find(g_SubclassedDefViews.begin(), g_SubclassedDefViews.end(),
                   hWnd) != g_SubclassedDefViews.end()) {
@@ -622,6 +881,7 @@ void SubclassDefView(HWND hWnd) {
                                                       0)) {
         RememberSubclassedWindow(g_SubclassedDefViews, hWnd);
         Wh_Log(L"SHELLDLL_DefView subclassed %p", hWnd);
+        PostFileListInsetUpdate(hWnd);
     }
 }
 
@@ -636,8 +896,11 @@ void TrySubclassExplorerView(HWND hWnd) {
         SubclassSysListView(hWnd);
         SubclassDefView(parent);
     } else if (IsWindowClass(hWnd, L"DirectUIHWND")) {
+        SubclassDirectUIView(hWnd);
         SubclassDefView(parent);
     }
+
+    PostFileListInsetUpdate(parent);
 }
 
 using CreateWindowExW_t = decltype(&CreateWindowExW);
@@ -683,7 +946,9 @@ BOOL CALLBACK InitEnumChildWindowsProc(HWND hWnd, LPARAM lParam) {
         if (listView) {
             SubclassSysListView(listView);
             SubclassDefView(hWnd);
-        } else if (directUI) {
+        }
+        if (directUI) {
+            SubclassDirectUIView(directUI);
             SubclassDefView(hWnd);
         }
     }
@@ -705,6 +970,13 @@ BOOL Wh_ModInit() {
     Wh_Log(L"Explorer Toggle Details Pane Init");
 
     LoadSettings();
+
+    g_updateFileListInsetMessage = RegisterWindowMessageW(
+        L"Windhawk.explorer-toggle-details-pane.UpdateFileListInset");
+    if (!g_updateFileListInsetMessage) {
+        Wh_Log(L"Failed to register file-list inset update message");
+        return FALSE;
+    }
 
     WindhawkUtils::SetFunctionHook((void*)CreateWindowExW,
                                    (void*)CreateWindowExW_Hook,
@@ -736,23 +1008,55 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModUninit() {
+    g_unloading = true;
+
+    // Restore each list on the owning Explorer UI thread before removing the
+    // subclasses which enforce its geometry.
+    for (HWND hWnd : g_SubclassedDefViews) {
+        if (!IsWindow(hWnd) ||
+            !IsWindowClass(hWnd, L"SHELLDLL_DefView")) {
+            continue;
+        }
+
+        DWORD_PTR messageResult = 0;
+        if (!SendMessageTimeoutW(
+                hWnd, g_updateFileListInsetMessage,
+                static_cast<WPARAM>(NavigationPaneVisibilityHint::Visible),
+                0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000,
+                &messageResult)) {
+            Wh_Log(L"UI-thread file-list restoration failed for %p", hWnd);
+            SetFileListLeftInset(hWnd, 0);
+        }
+    }
+
     for (HWND hWnd : g_SubclassedSysListViews) {
-        if (IsWindow(hWnd)) {
+        if (IsWindow(hWnd) && IsWindowClass(hWnd, L"SysListView32")) {
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(
                 hWnd, SysListViewSubclass);
             Wh_Log(L"SysListView32 unsubclassed %p", hWnd);
         }
     }
 
+    for (HWND hWnd : g_SubclassedDirectUIViews) {
+        if (IsWindow(hWnd) && IsWindowClass(hWnd, L"DirectUIHWND")) {
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(
+                hWnd, DirectUIWindowSubclass);
+            Wh_Log(L"DirectUIHWND unsubclassed %p", hWnd);
+        }
+    }
+
     for (HWND hWnd : g_SubclassedDefViews) {
-        if (IsWindow(hWnd)) {
+        if (IsWindow(hWnd) &&
+            IsWindowClass(hWnd, L"SHELLDLL_DefView")) {
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(hWnd,
                                                              DefViewSubclass);
+            RemovePropW(hWnd, kFileListInsetProperty);
             Wh_Log(L"SHELLDLL_DefView unsubclassed %p", hWnd);
         }
     }
 
     g_SubclassedSysListViews.clear();
+    g_SubclassedDirectUIViews.clear();
     g_SubclassedDefViews.clear();
     g_pUIAutomation = nullptr;
     g_comInitializer.Uninit();
