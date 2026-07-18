@@ -1,8 +1,11 @@
 # Local tool settings
 .claude/
 
+# Build outputs
+build/
+
 # Local reference checkout
-mods/windhawk-mods/
+references/windhawk-mods-upstream/
 
 # Backup files
 *.old
